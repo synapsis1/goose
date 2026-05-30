@@ -231,6 +231,66 @@ pub async fn classify_planner_response(
     }
 }
 
+/// Collect the names of `${VAR}` and `$VAR` references appearing in the given
+/// values, de-duplicated and in first-seen order.
+///
+/// Goose's [`substitute_env_vars`](goose::agents::extension_manager) resolves
+/// these at connect time, but only for names listed in the extension's
+/// `env_keys`. This mirrors the same `${VAR}` / `$VAR` syntax so a header value
+/// like `Bearer ${USER_JWT}` causes `USER_JWT` to be fetched from the
+/// environment / secret store.
+fn collect_env_var_refs<'a, I>(values: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    fn is_ident(c: char) -> bool {
+        c == '_' || c.is_ascii_alphanumeric()
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let chars: Vec<char> = value.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '$' {
+                // ${VAR}
+                if chars.get(i + 1) == Some(&'{') {
+                    let start = i + 2;
+                    let mut j = start;
+                    while j < chars.len() && chars[j] != '}' {
+                        j += 1;
+                    }
+                    if j < chars.len() && j > start {
+                        let name: String = chars[start..j].iter().collect();
+                        if name.chars().all(is_ident) && seen.insert(name.clone()) {
+                            out.push(name);
+                        }
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                // $VAR
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && is_ident(chars[j]) {
+                    j += 1;
+                }
+                if j > start {
+                    let name: String = chars[start..j].iter().collect();
+                    if seen.insert(name.clone()) {
+                        out.push(name);
+                    }
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 pub fn split_quoted(input: &str) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -339,7 +399,11 @@ impl CliSession {
         })
     }
 
-    pub fn parse_streamable_http_extension(extension_url: &str, timeout: u64) -> ExtensionConfig {
+    pub fn parse_streamable_http_extension(
+        extension_url: &str,
+        timeout: u64,
+        headers: HashMap<String, String>,
+    ) -> ExtensionConfig {
         let name = url::Url::parse(extension_url)
             .ok()
             .map(|u| {
@@ -361,12 +425,18 @@ impl CliSession {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unnamed".to_string());
 
+        // Collect any `${VAR}` references in header values so goose resolves
+        // them from the environment / secret store at connect time (see
+        // `merge_environments`). The secret is never placed on the command
+        // line — only the variable name travels through argv.
+        let env_keys = collect_env_var_refs(headers.values());
+
         ExtensionConfig::StreamableHttp {
             name,
             uri: extension_url.to_string(),
             envs: Envs::new(HashMap::new()),
-            env_keys: Vec::new(),
-            headers: HashMap::new(),
+            env_keys,
+            headers,
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(timeout),
             bundled: None,
@@ -424,6 +494,7 @@ impl CliSession {
         let config = Self::parse_streamable_http_extension(
             &extension_url,
             goose::config::DEFAULT_EXTENSION_TIMEOUT,
+            HashMap::new(),
         );
         self.add_and_persist_extensions(vec![config]).await
     }
@@ -2167,8 +2238,44 @@ mod tests {
     )]
     fn test_parse_streamable_http_extension(url: &str, timeout: u64, expected: ExtensionConfig) {
         assert_eq!(
-            CliSession::parse_streamable_http_extension(url, timeout),
+            CliSession::parse_streamable_http_extension(url, timeout, HashMap::new()),
             expected
         );
+    }
+
+    #[test]
+    fn test_streamable_http_extension_carries_headers_and_env_keys() {
+        // Given a header whose value references an env var, the built config
+        // carries the header verbatim and lists the referenced var in env_keys
+        // so goose resolves it at connect time.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer ${USER_JWT}".to_string(),
+        );
+        let config =
+            CliSession::parse_streamable_http_extension("https://host.example/mcp", 42, headers);
+        match config {
+            ExtensionConfig::StreamableHttp {
+                headers, env_keys, ..
+            } => {
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer ${USER_JWT}")
+                );
+                assert_eq!(env_keys, vec!["USER_JWT".to_string()]);
+            }
+            other => panic!("expected StreamableHttp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_collect_env_var_refs_dedup_and_syntaxes() {
+        let braced = "Bearer ${USER_JWT}".to_string();
+        let bare = "$TOKEN suffix".to_string();
+        let dup = "${USER_JWT}".to_string();
+        let none = "literal-value".to_string();
+        let refs = collect_env_var_refs([&braced, &bare, &dup, &none]);
+        assert_eq!(refs, vec!["USER_JWT".to_string(), "TOKEN".to_string()]);
     }
 }

@@ -112,11 +112,21 @@ pub struct SessionOptions {
 pub struct StreamableHttpOptions {
     pub url: String,
     pub timeout: u64,
+    /// Static request headers to attach to every call to this extension.
+    ///
+    /// Values may reference environment variables with `${VAR}` syntax; goose
+    /// substitutes them from the process environment (or secret store) when the
+    /// extension connects. This is how a caller injects an `Authorization`
+    /// header without exposing the secret on the command line — e.g.
+    /// `--with-streamable-http-extension 'https://host/mcp header=Authorization=${USER_JWT}'`
+    /// with `USER_JWT` set in the environment.
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 fn parse_streamable_http_extension(input: &str) -> Result<StreamableHttpOptions, String> {
     let mut input_iter = input.split_whitespace();
     let (mut url, mut timeout) = (String::new(), goose::config::DEFAULT_EXTENSION_TIMEOUT);
+    let mut headers = std::collections::HashMap::new();
 
     if let Some(url_str) = input_iter.next() {
         url.push_str(url_str);
@@ -130,14 +140,32 @@ fn parse_streamable_http_extension(input: &str) -> Result<StreamableHttpOptions,
         let (key, value) = kv_pair.split_once('=').unwrap();
 
         // We Can have more keys here for setting other properties
-        if key == "timeout" {
-            if let Ok(seconds) = value.parse::<u64>() {
-                timeout = seconds;
+        match key {
+            "timeout" => {
+                if let Ok(seconds) = value.parse::<u64>() {
+                    timeout = seconds;
+                }
             }
+            // `header=Name=Value` — the value is split on the FIRST '=', so the
+            // header value itself may contain '=' (e.g. base64 padding) but not
+            // whitespace (the input is whitespace-tokenised). Reference an env
+            // var (`${VAR}`) when the value needs spaces, such as a bearer token.
+            "header" => {
+                if let Some((name, val)) = value.split_once('=') {
+                    if !name.is_empty() {
+                        headers.insert(name.to_string(), val.to_string());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    Ok(StreamableHttpOptions { url, timeout })
+    Ok(StreamableHttpOptions {
+        url,
+        timeout,
+        headers,
+    })
 }
 
 /// Extension configuration options shared between Session and Run commands
@@ -156,7 +184,7 @@ pub struct ExtensionOptions {
         long = "with-streamable-http-extension",
         value_name = "URL",
         help = "Add streamable HTTP extensions (can be specified multiple times)",
-        long_help = "Add streamable HTTP extensions from a URL. Can be specified multiple times. Format: 'url...' or 'url... timeout=100' to set up timeout other than default",
+        long_help = "Add streamable HTTP extensions from a URL. Can be specified multiple times. Format: 'url', 'url timeout=100' to set a non-default timeout, and/or 'url header=Name=Value' to attach a request header (repeatable). Header values may reference an environment variable with ${VAR} (resolved at connect time) so secrets such as a bearer token stay off the command line, e.g. 'https://host/mcp header=Authorization=${USER_JWT}'.",
         action = clap::ArgAction::Append,
         value_parser = parse_streamable_http_extension
     )]
@@ -1849,5 +1877,56 @@ pub async fn cli() -> anyhow::Result<()> {
             }
         }
         None => handle_default_session().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_streamable_http_extension_url_only() {
+        let opts = parse_streamable_http_extension("https://host.example/mcp").expect("parse");
+        assert_eq!(opts.url, "https://host.example/mcp");
+        assert_eq!(opts.timeout, goose::config::DEFAULT_EXTENSION_TIMEOUT);
+        assert!(opts.headers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_streamable_http_extension_timeout_and_header() {
+        // `header=Name=Value`; the value references an env var so the secret
+        // never appears on the command line, and the parser keeps it verbatim.
+        let opts = parse_streamable_http_extension(
+            "https://host.example/mcp timeout=42 header=Authorization=${USER_JWT}",
+        )
+        .expect("parse");
+        assert_eq!(opts.url, "https://host.example/mcp");
+        assert_eq!(opts.timeout, 42);
+        assert_eq!(
+            opts.headers.get("Authorization").map(String::as_str),
+            Some("${USER_JWT}")
+        );
+    }
+
+    #[test]
+    fn test_parse_streamable_http_extension_multiple_headers() {
+        let opts = parse_streamable_http_extension(
+            "https://host.example/mcp header=Authorization=${USER_JWT} header=X-Trace=abc",
+        )
+        .expect("parse");
+        assert_eq!(opts.headers.len(), 2);
+        assert_eq!(
+            opts.headers.get("Authorization").map(String::as_str),
+            Some("${USER_JWT}")
+        );
+        assert_eq!(opts.headers.get("X-Trace").map(String::as_str), Some("abc"));
+    }
+
+    #[test]
+    fn test_parse_streamable_http_extension_malformed_header_ignored() {
+        // A `header=` with no inner '=' (no value) is skipped rather than erroring.
+        let opts = parse_streamable_http_extension("https://host.example/mcp header=NoValue")
+            .expect("parse");
+        assert!(opts.headers.is_empty());
     }
 }

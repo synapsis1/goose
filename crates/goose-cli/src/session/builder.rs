@@ -55,7 +55,11 @@ fn parse_cli_flag_extensions(
     }
 
     for (idx, opts) in streamable_http_extensions.iter().enumerate() {
-        let config = CliSession::parse_streamable_http_extension(&opts.url, opts.timeout);
+        let config = CliSession::parse_streamable_http_extension(
+            &opts.url,
+            opts.timeout,
+            opts.headers.clone(),
+        );
         let hint = truncate_with_ellipsis(&opts.url, EXTENSION_HINT_MAX_LEN);
         let label = format!("http #{}({})", idx + 1, hint);
         extensions_to_load.push((label, config));
@@ -765,6 +769,7 @@ mod tests {
             streamable_http_extensions: vec![StreamableHttpOptions {
                 url: "http://localhost:8080/mcp".to_string(),
                 timeout: goose::config::DEFAULT_EXTENSION_TIMEOUT,
+                headers: std::collections::HashMap::new(),
             }],
             builtins: vec!["developer".to_string()],
             no_profile: false,
