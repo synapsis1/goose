@@ -39,7 +39,8 @@ use crate::action_required_manager::ActionRequiredManager;
 use crate::agents::extension::{Envs, ProcessExit};
 use crate::agents::extension_malware_check;
 use crate::agents::mcp_client::{
-    GooseMcpClientCapabilities, GooseMcpHostInfo, McpClient, McpClientTrait,
+    streamable_http_lifecycle, GooseMcpClientCapabilities, GooseMcpHostInfo, McpClient,
+    McpClientTrait,
 };
 use crate::builtin_extension::get_builtin_extension;
 use crate::config::extensions::name_to_key;
@@ -658,10 +659,11 @@ async fn connect_with_auth(
         StreamableHttpClientTransportConfig::with_uri(uri),
     );
     Ok(Box::new(
-        McpClient::connect(
+        McpClient::connect_with_lifecycle(
             transport,
             timeout,
             provider,
+            streamable_http_lifecycle(),
             client_name,
             capabilities,
             roots_dir.to_path_buf(),
@@ -789,10 +791,11 @@ async fn create_streamable_http_client(
         }
     }
 
-    let client_res = McpClient::connect(
+    let client_res = McpClient::connect_with_lifecycle(
         transport,
         timeout_duration,
         provider.clone(),
+        streamable_http_lifecycle(),
         client_name.clone(),
         capabilities.clone(),
         roots_dir.to_path_buf(),
@@ -875,10 +878,11 @@ async fn create_unix_socket_http_client(
 
     let timeout_duration = Duration::from_secs(resolve_timeout(timeout));
 
-    let client_res = McpClient::connect(
+    let client_res = McpClient::connect_with_lifecycle(
         transport,
         timeout_duration,
         provider.clone(),
+        streamable_http_lifecycle(),
         client_name.clone(),
         capabilities.clone(),
         roots_dir.to_path_buf(),

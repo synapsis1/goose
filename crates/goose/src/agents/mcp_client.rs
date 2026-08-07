@@ -5,7 +5,8 @@ use crate::agents::types::SharedProvider;
 use crate::session_context::{SESSION_ID_HEADER, TOOL_CALL_REQUEST_ID_HEADER, WORKING_DIR_HEADER};
 use rmcp::model::{
     ContentBlock, ElicitationAction, ErrorCode, ExtensionCapabilities, Extensions, InputRequest,
-    InputRequiredResult, InputResponses, JsonObject, MetaObject, DEFAULT_MRTR_MAX_ROUNDS,
+    InputRequiredResult, InputResponses, JsonObject, MetaObject, ProtocolVersion,
+    DEFAULT_MRTR_MAX_ROUNDS,
 };
 /// MCP client implementation for Goose
 #[expect(deprecated)]
@@ -29,7 +30,8 @@ use rmcp::{
         ServiceRole,
     },
     transport::IntoTransport,
-    ClientHandler, ErrorData, Peer, RoleClient, ServiceError, ServiceExt,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt, ErrorData, Peer, RoleClient,
+    ServiceError,
 };
 use serde_json::Value;
 use std::{
@@ -359,6 +361,28 @@ impl GooseClient {
 /// `input_required` rounds).
 const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Lifecycle used for streamable-HTTP connections.
+///
+/// Defaults to [`ClientLifecycleMode::Auto`]: probe `server/discover`
+/// (MCP 2026-07-28) and fall back to the legacy `initialize` handshake when
+/// the server responds with "method not found". Negotiating 2026-07-28 is what
+/// allows servers to use SEP-2322 multi round-trip requests (`input_required`)
+/// against this client. Set `GOOSE_MCP_LIFECYCLE=initialize` to force the
+/// legacy handshake for every server.
+pub(crate) fn streamable_http_lifecycle() -> ClientLifecycleMode {
+    lifecycle_from_setting(std::env::var("GOOSE_MCP_LIFECYCLE").ok().as_deref())
+}
+
+fn lifecycle_from_setting(setting: Option<&str>) -> ClientLifecycleMode {
+    match setting {
+        Some(value) if value.eq_ignore_ascii_case("initialize") => ClientLifecycleMode::Initialize,
+        _ => ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            legacy_version: None,
+        },
+    }
+}
+
 /// Route one elicitation request through the action-required UI machinery and
 /// wait for the user's response.
 ///
@@ -639,11 +663,49 @@ impl McpClient {
         T: IntoTransport<RoleClient, E, A>,
         E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
     {
-        Self::connect_with_container(
+        Self::connect_with_options(
             transport,
             timeout,
             provider,
             None,
+            ClientLifecycleMode::Initialize,
+            client_name,
+            capabilities,
+            working_dir,
+            action_required,
+            extension_manager,
+        )
+        .await
+    }
+
+    /// Like [`Self::connect`], but with an explicit MCP lifecycle mode.
+    ///
+    /// Streamable-HTTP connections pass [`streamable_http_lifecycle`] here so
+    /// they can negotiate MCP 2026-07-28 via `server/discover` (with automatic
+    /// fallback to the legacy `initialize` handshake); stdio and in-process
+    /// transports stay on [`ClientLifecycleMode::Initialize`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_with_lifecycle<T, E, A>(
+        transport: T,
+        timeout: std::time::Duration,
+        provider: SharedProvider,
+        lifecycle: ClientLifecycleMode,
+        client_name: String,
+        capabilities: GooseMcpClientCapabilities,
+        working_dir: PathBuf,
+        action_required: Arc<ActionRequiredManager>,
+        extension_manager: Weak<ExtensionManager>,
+    ) -> Result<Self, ClientInitializeError>
+    where
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
+    {
+        Self::connect_with_options(
+            transport,
+            timeout,
+            provider,
+            None,
+            lifecycle,
             client_name,
             capabilities,
             working_dir,
@@ -669,6 +731,38 @@ impl McpClient {
         T: IntoTransport<RoleClient, E, A>,
         E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
     {
+        Self::connect_with_options(
+            transport,
+            timeout,
+            provider,
+            docker_container,
+            ClientLifecycleMode::Initialize,
+            client_name,
+            capabilities,
+            working_dir,
+            action_required,
+            extension_manager,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_with_options<T, E, A>(
+        transport: T,
+        timeout: std::time::Duration,
+        provider: SharedProvider,
+        docker_container: Option<String>,
+        lifecycle: ClientLifecycleMode,
+        client_name: String,
+        capabilities: GooseMcpClientCapabilities,
+        working_dir: PathBuf,
+        action_required: Arc<ActionRequiredManager>,
+        extension_manager: Weak<ExtensionManager>,
+    ) -> Result<Self, ClientInitializeError>
+    where
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
+    {
         let notification_subscribers =
             Arc::new(Mutex::new(Vec::<mpsc::Sender<ServerNotification>>::new()));
 
@@ -682,7 +776,7 @@ impl McpClient {
             extension_manager,
         );
         let client: rmcp::service::RunningService<rmcp::RoleClient, GooseClient> =
-            client.serve(transport).await?;
+            client.serve_with_lifecycle(transport, lifecycle).await?;
         let server_info = client.peer_info().map(|info| {
             let mut initialize_result = InitializeResult::new(info.capabilities.clone())
                 .with_protocol_version(info.protocol_version.clone());
@@ -1877,6 +1971,29 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_lifecycle_defaults_to_auto_discover() {
+        let expected = ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            legacy_version: None,
+        };
+        assert_eq!(lifecycle_from_setting(None), expected);
+        assert_eq!(lifecycle_from_setting(Some("auto")), expected);
+        assert_eq!(lifecycle_from_setting(Some("")), expected);
+    }
+
+    #[test]
+    fn test_lifecycle_initialize_override() {
+        assert_eq!(
+            lifecycle_from_setting(Some("initialize")),
+            ClientLifecycleMode::Initialize
+        );
+        assert_eq!(
+            lifecycle_from_setting(Some("INITIALIZE")),
+            ClientLifecycleMode::Initialize
+        );
+    }
+
     fn form_elicitation_params() -> ElicitRequestParams {
         ElicitRequestParams::FormElicitationParams {
             meta: None,
@@ -1960,5 +2077,105 @@ mod tests {
         let cancelled = drive_elicitation(ElicitationOutcome::Cancel).await;
         assert_eq!(cancelled.action, ElicitationAction::Cancel);
         assert_eq!(cancelled.content, None);
+    }
+
+    /// Manual end-to-end check of the MRTR `input_required` driving loop.
+    ///
+    /// Requires an MRTR-capable MCP server (protocol 2026-07-28, e.g. rmcp's
+    /// `servers_mrtr` example adapted to expose a `guarded_write` tool that
+    /// asks for `{"approve": "yes"|"no"}` via elicitation) reachable at
+    /// `GOOSE_MRTR_PROBE_URI` (default `http://127.0.0.1:39124/mcp`).
+    #[tokio::test]
+    #[ignore = "manual: requires an MRTR-capable MCP server at GOOSE_MRTR_PROBE_URI"]
+    async fn mrtr_input_required_end_to_end() {
+        use rmcp::transport::StreamableHttpClientTransport;
+
+        let uri = std::env::var("GOOSE_MRTR_PROBE_URI")
+            .unwrap_or_else(|_| "http://127.0.0.1:39124/mcp".to_string());
+
+        let action_required = Arc::new(ActionRequiredManager::new());
+        let mut action_required_rx = action_required
+            .register_action_required_stream("mrtr-session".to_string(), "tool-req-1".to_string())
+            .await;
+
+        let client = McpClient::connect_with_lifecycle(
+            StreamableHttpClientTransport::from_uri(uri),
+            Duration::from_secs(30),
+            Arc::new(Mutex::new(None)),
+            streamable_http_lifecycle(),
+            "goose-mrtr-test".to_string(),
+            GooseMcpClientCapabilities {
+                mcpui: false,
+                host_info: None,
+            },
+            std::env::current_dir().unwrap_or_default(),
+            action_required.clone(),
+            Weak::new(),
+        )
+        .await
+        .expect("connect to probe server");
+
+        let negotiated = client
+            .get_info()
+            .map(|info| info.protocol_version.to_string());
+        println!("negotiated protocol version: {negotiated:?}");
+
+        // Answer the elicitation the way the UI would, as soon as it arrives.
+        let responder = {
+            let action_required = action_required.clone();
+            tokio::spawn(async move {
+                let message =
+                    tokio::time::timeout(Duration::from_secs(10), action_required_rx.recv())
+                        .await
+                        .expect("timed out waiting for elicitation")
+                        .expect("action-required stream closed");
+                let request_id = match &message.content[0] {
+                    crate::conversation::message::MessageContent::ActionRequired(
+                        action_required_content,
+                    ) => match &action_required_content.data {
+                        crate::conversation::message::ActionRequiredData::Elicitation {
+                            id,
+                            message,
+                            ..
+                        } => {
+                            println!("elicitation received: {message}");
+                            id.clone()
+                        }
+                        _ => panic!("expected elicitation action-required message"),
+                    },
+                    _ => panic!("expected action-required message"),
+                };
+                action_required
+                    .claim_response("mrtr-session", &request_id)
+                    .await
+                    .expect("claim elicitation")
+                    .submit(ElicitationOutcome::Accept(json!({ "approve": "yes" })))
+                    .expect("submit elicitation outcome");
+            })
+        };
+
+        let ctx = ToolCallContext::new(
+            "mrtr-session".to_string(),
+            None,
+            Some("tool-req-1".to_string()),
+        );
+        let result = client
+            .call_tool(&ctx, "guarded_write", None, CancellationToken::new())
+            .await
+            .expect("guarded_write should complete after the input_required round");
+        responder.await.expect("responder task panicked");
+
+        assert_ne!(result.is_error, Some(true));
+        let text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        println!("guarded_write result: {text}");
+        assert!(
+            text.contains("APPLIED"),
+            "expected the approved write to be applied, got: {text}"
+        );
     }
 }
