@@ -157,6 +157,14 @@ enum StreamEvent {
     Error {
         error: String,
     },
+    /// Headless stdin bridge (`GOOSE_ELICITATION_BRIDGE=stdin`): an MCP
+    /// elicitation the host must answer with one JSON line on stdin —
+    /// `{"type":"elicitation_response","id":..,"action":"accept"|"decline"|"cancel","content":{..}}`.
+    Elicitation {
+        id: String,
+        message: String,
+        requested_schema: Value,
+    },
     Complete {
         total_tokens: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1411,7 +1419,10 @@ impl CliSession {
                                     break;
                                 }
                             } else if let Some((elicitation_id, elicitation_message, schema)) = find_elicitation_request(&message) {
-                                if !interactive {
+                                let bridge = !interactive
+                                    && is_stream_json_mode
+                                    && elicitation::stdin_bridge_enabled();
+                                if !interactive && !bridge {
                                     // Non-interactive/headless mode: cannot collect user input
                                     tracing::warn!(
                                         "Elicitation requested in non-interactive mode, cancelling"
@@ -1423,10 +1434,55 @@ impl CliSession {
                                     ));
                                 }
 
-                                output::hide_thinking();
-                                let _ = progress_bars.hide();
+                                if !bridge {
+                                    output::hide_thinking();
+                                    let _ = progress_bars.hide();
+                                }
 
-                                match elicitation::collect_elicitation_input(&elicitation_message, &schema) {
+                                let collected = if bridge {
+                                    // Stdin bridge: hand the elicitation to the host process
+                                    // as a stream event and wait for its one-line answer.
+                                    emit_stream_event(&StreamEvent::Elicitation {
+                                        id: elicitation_id.clone(),
+                                        message: elicitation_message.clone(),
+                                        requested_schema: schema.clone(),
+                                    });
+                                    let expected_id = elicitation_id.clone();
+                                    let timeout = elicitation::stdin_bridge_timeout();
+                                    let read = tokio::time::timeout(
+                                        timeout,
+                                        tokio::task::spawn_blocking(elicitation::read_bridge_line),
+                                    )
+                                    .await;
+                                    match read {
+                                        Ok(Ok(Ok(Some(line)))) => {
+                                            elicitation::parse_bridge_response(&line, &expected_id)
+                                        }
+                                        Ok(Ok(Ok(None))) => {
+                                            tracing::warn!("elicitation bridge: stdin closed, cancelling");
+                                            Ok(elicitation::ElicitationInput {
+                                                action: ElicitationAction::Cancel,
+                                                user_data: Default::default(),
+                                            })
+                                        }
+                                        Ok(Ok(Err(e))) => Err(e),
+                                        Ok(Err(join)) => Err(std::io::Error::other(join.to_string())),
+                                        Err(_elapsed) => {
+                                            tracing::warn!(
+                                                timeout_secs = timeout.as_secs(),
+                                                "elicitation bridge: no answer before the timeout, cancelling"
+                                            );
+                                            Ok(elicitation::ElicitationInput {
+                                                action: ElicitationAction::Cancel,
+                                                user_data: Default::default(),
+                                            })
+                                        }
+                                    }
+                                } else {
+                                    elicitation::collect_elicitation_input(&elicitation_message, &schema)
+                                };
+
+                                match collected {
                                     Ok(input) => {
                                         match &input.action {
                                             ElicitationAction::Decline => {

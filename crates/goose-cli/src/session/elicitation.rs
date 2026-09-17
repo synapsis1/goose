@@ -22,6 +22,88 @@ struct SingleSelect<'a> {
     initial_value: Option<SelectChoice>,
 }
 
+/// Environment variable that switches headless `goose run --output-format
+/// stream-json` from "cancel every elicitation" to the stdin bridge: the
+/// elicitation is emitted as a `{"type":"elicitation",...}` stream event and
+/// the answer is read back as one JSON line on stdin.
+pub const ELICITATION_BRIDGE_ENV: &str = "GOOSE_ELICITATION_BRIDGE";
+
+/// Seconds the stdin bridge waits for an answer before cancelling the
+/// elicitation (`GOOSE_ELICITATION_TIMEOUT_SECS`, default 300).
+pub const ELICITATION_TIMEOUT_ENV: &str = "GOOSE_ELICITATION_TIMEOUT_SECS";
+
+/// Whether the stdin bridge is enabled (`GOOSE_ELICITATION_BRIDGE=stdin`).
+pub fn stdin_bridge_enabled() -> bool {
+    std::env::var(ELICITATION_BRIDGE_ENV)
+        .map(|v| v.eq_ignore_ascii_case("stdin"))
+        .unwrap_or(false)
+}
+
+/// The bridge's answer timeout.
+pub fn stdin_bridge_timeout() -> std::time::Duration {
+    let secs = std::env::var(ELICITATION_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
+}
+
+/// One answer line on the stdin bridge:
+/// `{"type":"elicitation_response","id":"<elicitation id>","action":"accept"|"decline"|"cancel","content":{...}}`.
+#[derive(Debug, serde::Deserialize)]
+pub struct BridgeResponse {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    pub action: String,
+    #[serde(default)]
+    pub content: Option<Value>,
+}
+
+/// Parse one bridge answer line for elicitation `expected_id`. A line for
+/// another id, an unknown action, or malformed JSON is an error (the caller
+/// cancels the elicitation rather than guessing).
+pub fn parse_bridge_response(line: &str, expected_id: &str) -> io::Result<ElicitationInput> {
+    let resp: BridgeResponse = serde_json::from_str(line.trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("elicitation bridge: {e}")))?;
+    if resp.kind != "elicitation_response" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("elicitation bridge: unexpected type {:?}", resp.kind),
+        ));
+    }
+    if resp.id != expected_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("elicitation bridge: answer for {:?}, expected {:?}", resp.id, expected_id),
+        ));
+    }
+    let action = match resp.action.as_str() {
+        "accept" => ElicitationAction::Accept,
+        "decline" => ElicitationAction::Decline,
+        "cancel" => ElicitationAction::Cancel,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("elicitation bridge: unknown action {other:?}"),
+            ))
+        }
+    };
+    let user_data: HashMap<String, Value> = match resp.content {
+        Some(Value::Object(map)) => map.into_iter().collect(),
+        _ => HashMap::new(),
+    };
+    Ok(ElicitationInput { action, user_data })
+}
+
+/// Read one line from stdin (blocking; run under `spawn_blocking`).
+/// `Ok(None)` on EOF.
+pub fn read_bridge_line() -> io::Result<Option<String>> {
+    let mut line = String::new();
+    let n = io::stdin().lock().read_line(&mut line)?;
+    Ok(if n == 0 { None } else { Some(line) })
+}
+
 pub fn collect_elicitation_input(message: &str, schema: &Value) -> io::Result<ElicitationInput> {
     if !message.is_empty() {
         println!("\n{}", style(message).cyan());
@@ -414,5 +496,39 @@ mod tests {
     }); "oneOf branch without const")]
     fn unsupported_schema_does_not_build_select(schema: Value) {
         assert!(single_select(&schema).is_none());
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    #[test]
+    fn parses_accept_with_content() {
+        let input = parse_bridge_response(
+            r#"{"type":"elicitation_response","id":"e1","action":"accept","content":{"approve":"yes"}}"#,
+            "e1",
+        )
+        .unwrap();
+        assert_eq!(input.action, ElicitationAction::Accept);
+        assert_eq!(input.user_data.get("approve"), Some(&Value::String("yes".into())));
+    }
+
+    #[test]
+    fn parses_decline_and_cancel_without_content() {
+        for (action, expected) in [("decline", ElicitationAction::Decline), ("cancel", ElicitationAction::Cancel)] {
+            let line = format!(r#"{{"type":"elicitation_response","id":"e1","action":"{action}"}}"#);
+            let input = parse_bridge_response(&line, "e1").unwrap();
+            assert_eq!(input.action, expected);
+            assert!(input.user_data.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_id_type_or_action() {
+        assert!(parse_bridge_response(r#"{"type":"elicitation_response","id":"other","action":"accept"}"#, "e1").is_err());
+        assert!(parse_bridge_response(r#"{"type":"nope","id":"e1","action":"accept"}"#, "e1").is_err());
+        assert!(parse_bridge_response(r#"{"type":"elicitation_response","id":"e1","action":"maybe"}"#, "e1").is_err());
+        assert!(parse_bridge_response("not json", "e1").is_err());
     }
 }
