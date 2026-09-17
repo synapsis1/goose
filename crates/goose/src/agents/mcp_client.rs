@@ -3,6 +3,10 @@ use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::tool_execution::ToolCallContext;
 use crate::agents::types::SharedProvider;
 use crate::session_context::{SESSION_ID_HEADER, TOOL_CALL_REQUEST_ID_HEADER, WORKING_DIR_HEADER};
+use rmcp::model::{
+    ContentBlock, ElicitationAction, ErrorCode, ExtensionCapabilities, Extensions, InputRequest,
+    InputRequiredResult, InputResponses, JsonObject, MetaObject, DEFAULT_MRTR_MAX_ROUNDS,
+};
 /// MCP client implementation for Goose
 #[expect(deprecated)]
 use rmcp::model::{CreateMessageRequestParams, CreateMessageResult, SamplingMessage};
@@ -10,9 +14,6 @@ use rmcp::model::{CreateMessageRequestParams, CreateMessageResult, SamplingMessa
 use rmcp::model::{
     ElicitRequestParams, ElicitResult, ListRootsResult, LoggingMessageNotification, Root,
     SamplingMessageContentBlock,
-};
-use rmcp::model::{
-    ElicitationAction, ErrorCode, ExtensionCapabilities, Extensions, JsonObject, MetaObject,
 };
 use rmcp::{
     model::{
@@ -220,6 +221,12 @@ impl GooseClient {
         self.working_dir.clone()
     }
 
+    /// Handle to the action-required UI machinery, so callers can fulfil
+    /// elicitation requests without holding a borrow of the running service.
+    pub(crate) fn action_required(&self) -> Arc<ActionRequiredManager> {
+        self.action_required.clone()
+    }
+
     async fn set_session_id(&self, session_id: &str) {
         let mut slot = self.session_id.lock().await;
         assert!(
@@ -345,6 +352,70 @@ impl GooseClient {
 
         Implementation::new(name, version)
     }
+}
+
+/// How long to wait for the user to answer an elicitation request before
+/// giving up (shared by direct `elicitation/create` requests and MRTR
+/// `input_required` rounds).
+const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Route one elicitation request through the action-required UI machinery and
+/// wait for the user's response.
+///
+/// Shared by [`ClientHandler::create_elicitation`] (server-initiated
+/// `elicitation/create` while a request is in flight) and the MRTR
+/// `input_required` driving loop in [`McpClient::call_tool`], so both paths
+/// present the same UI and map outcomes identically.
+async fn fulfill_elicitation(
+    action_required: &ActionRequiredManager,
+    session_id: String,
+    tool_call_request_id: String,
+    request: &ElicitRequestParams,
+) -> Result<ElicitResult, ErrorData> {
+    let (message, schema_value) = match request {
+        ElicitRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } => {
+            let schema_value = serde_json::to_value(requested_schema).map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to serialize elicitation schema: {}", e),
+                    None,
+                )
+            })?;
+            (message.clone(), schema_value)
+        }
+        ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
+            (message.clone(), serde_json::json!({ "url": url }))
+        }
+        _ => (String::new(), serde_json::json!({})),
+    };
+
+    action_required
+        .request_and_wait(
+            session_id,
+            tool_call_request_id,
+            message,
+            schema_value,
+            ELICITATION_TIMEOUT,
+        )
+        .await
+        .map(|response| match response {
+            ElicitationOutcome::Accept(user_data) => {
+                ElicitResult::new(ElicitationAction::Accept).with_content(user_data)
+            }
+            ElicitationOutcome::Decline => ElicitResult::new(ElicitationAction::Decline),
+            ElicitationOutcome::Cancel => ElicitResult::new(ElicitationAction::Cancel),
+        })
+        .map_err(|e| {
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Elicitation request timed out or failed: {}", e),
+                None,
+            )
+        })
 }
 
 #[expect(deprecated)]
@@ -512,50 +583,13 @@ impl ClientHandler for GooseClient {
         let tool_call_request_id =
             self.resolve_tool_call_request_id(&session_id, &context.extensions)?;
 
-        let (message, schema_value) = match &request {
-            ElicitRequestParams::FormElicitationParams {
-                message,
-                requested_schema,
-                ..
-            } => {
-                let schema_value = serde_json::to_value(requested_schema).map_err(|e| {
-                    ErrorData::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Failed to serialize elicitation schema: {}", e),
-                        None,
-                    )
-                })?;
-                (message.clone(), schema_value)
-            }
-            ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
-                (message.clone(), serde_json::json!({ "url": url }))
-            }
-            _ => (String::new(), serde_json::json!({})),
-        };
-
-        self.action_required
-            .request_and_wait(
-                session_id,
-                tool_call_request_id,
-                message,
-                schema_value,
-                Duration::from_secs(300),
-            )
-            .await
-            .map(|response| match response {
-                ElicitationOutcome::Accept(user_data) => {
-                    ElicitResult::new(ElicitationAction::Accept).with_content(user_data)
-                }
-                ElicitationOutcome::Decline => ElicitResult::new(ElicitationAction::Decline),
-                ElicitationOutcome::Cancel => ElicitResult::new(ElicitationAction::Cancel),
-            })
-            .map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Elicitation request timed out or failed: {}", e),
-                    None,
-                )
-            })
+        fulfill_elicitation(
+            &self.action_required,
+            session_id,
+            tool_call_request_id,
+            &request,
+        )
+        .await
     }
 
     fn get_info(&self) -> ClientInfo {
@@ -716,6 +750,136 @@ impl McpClient {
 
         await_response(handle, self.timeout, &cancel_token).await
     }
+
+    /// Fulfil one MRTR `input_required` round: answer every input request the
+    /// server sent, and produce the parameters for the retry.
+    ///
+    /// Only elicitation input requests are fulfillable through goose's
+    /// action-required UI today; sampling and roots input requests fail the
+    /// call with a clear error rather than looping. A decline or cancel from
+    /// the user aborts the call with a tool-error result instead of retrying.
+    async fn drive_input_required_round(
+        &self,
+        ctx: &ToolCallContext,
+        result: InputRequiredResult,
+        state_only_rounds: &mut usize,
+        cancel_token: &CancellationToken,
+    ) -> Result<InputRequiredTurn, Error> {
+        let input_requests = result.input_requests.unwrap_or_default();
+        // Spec: at least one of `inputRequests` / `requestState` must be set.
+        if input_requests.is_empty() && result.request_state.is_none() {
+            return Err(ServiceError::UnexpectedResponse);
+        }
+
+        // Clone the manager handle out so the client mutex is not held while
+        // waiting (potentially minutes) for the user's answers.
+        let action_required = self.client.lock().await.service().action_required();
+
+        let mut responses = InputResponses::new();
+        for (key, input_request) in input_requests {
+            let elicit_params = match input_request {
+                InputRequest::Elicitation(request) => request.params,
+                other => {
+                    let kind = match &other {
+                        InputRequest::CreateMessage(_) => "sampling/createMessage",
+                        InputRequest::ListRoots(_) => "roots/list",
+                        _ => "unknown",
+                    };
+                    return Err(ServiceError::McpError(ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Server requested additional input of kind '{kind}' (input request \
+                             '{key}'), which this client cannot fulfil in an input_required \
+                             round; only elicitation is supported"
+                        ),
+                        None,
+                    )));
+                }
+            };
+
+            let tool_call_request_id = ctx
+                .tool_call_request_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    ServiceError::McpError(ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Server requested elicitation (input request '{key}') but no tool \
+                             call request id is available to route it to the UI"
+                        ),
+                        None,
+                    ))
+                })?
+                .to_string();
+
+            let elicit_result = tokio::select! {
+                result = fulfill_elicitation(
+                    &action_required,
+                    ctx.session_id.clone(),
+                    tool_call_request_id,
+                    &elicit_params,
+                ) => result.map_err(ServiceError::McpError)?,
+                () = cancel_token.cancelled() => {
+                    return Err(ServiceError::Cancelled { reason: None });
+                }
+            };
+
+            match elicit_result.action {
+                ElicitationAction::Accept => {}
+                action => {
+                    let verb = if action == ElicitationAction::Decline {
+                        "declined"
+                    } else {
+                        "cancelled"
+                    };
+                    return Ok(InputRequiredTurn::Abort(CallToolResult::error(vec![
+                        ContentBlock::text(format!(
+                            "The user {verb} the request for additional input; the tool call \
+                             was not completed."
+                        )),
+                    ])));
+                }
+            }
+
+            let value = serde_json::to_value(&elicit_result).map_err(|error| {
+                ServiceError::McpError(ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to serialize elicitation response '{key}': {error}"),
+                    None,
+                ))
+            })?;
+            responses.insert(key, value);
+        }
+
+        if responses.is_empty() {
+            // State-only round: the server is still working. Back off briefly
+            // before retrying so we don't spin (mirrors rmcp's client).
+            let millis = (50u64.saturating_mul(1 << (*state_only_rounds).min(3))).min(250);
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            *state_only_rounds += 1;
+        } else {
+            *state_only_rounds = 0;
+        }
+
+        Ok(InputRequiredTurn::Retry {
+            input_responses: (!responses.is_empty()).then_some(responses),
+            // Echo `requestState` back exactly as received (including its
+            // absence); clients must never inspect or synthesize it.
+            request_state: result.request_state,
+        })
+    }
+}
+
+/// Outcome of one fulfilled `input_required` round.
+enum InputRequiredTurn {
+    /// Retry the original request with these MRTR parameters.
+    Retry {
+        input_responses: Option<InputResponses>,
+        request_state: Option<String>,
+    },
+    /// Stop without retrying and return this result for the tool call.
+    Abort(CallToolResult),
 }
 
 async fn await_response(
@@ -841,22 +1005,54 @@ impl McpClientTrait for McpClient {
         if let Some(args) = arguments {
             params = params.with_arguments(args);
         }
-        let request = ClientRequest::CallToolRequest(Request::new(params));
 
-        let result = self
-            .send_request_with_context(
-                &ctx.session_id,
-                ctx.working_dir_str(),
-                ctx.tool_call_request_id.as_deref(),
-                request,
-                cancel_token,
-            )
-            .await;
+        // SEP-2322 multi round-trip requests (MCP 2026-07-28): a server may
+        // answer `tools/call` with `input_required` instead of a final result.
+        // Fulfil its input requests locally, then retry the call with the
+        // responses and the echoed `requestState`, up to the same round cap
+        // rmcp's own high-level client uses.
+        let mut state_only_rounds = 0usize;
+        for _round in 0..DEFAULT_MRTR_MAX_ROUNDS {
+            let request = ClientRequest::CallToolRequest(Request::new(params.clone()));
 
-        match result? {
-            ServerResult::CallToolResult(result) => Ok(result),
-            _ => Err(ServiceError::UnexpectedResponse),
+            let result = self
+                .send_request_with_context(
+                    &ctx.session_id,
+                    ctx.working_dir_str(),
+                    ctx.tool_call_request_id.as_deref(),
+                    request,
+                    cancel_token.clone(),
+                )
+                .await?;
+
+            let input_required = match result {
+                ServerResult::CallToolResult(result) => return Ok(result),
+                ServerResult::InputRequiredResult(input_required) => input_required,
+                _ => return Err(ServiceError::UnexpectedResponse),
+            };
+
+            match self
+                .drive_input_required_round(
+                    ctx,
+                    input_required,
+                    &mut state_only_rounds,
+                    &cancel_token,
+                )
+                .await?
+            {
+                InputRequiredTurn::Retry {
+                    input_responses,
+                    request_state,
+                } => {
+                    params.input_responses = input_responses;
+                    params.request_state = request_state;
+                }
+                InputRequiredTurn::Abort(result) => return Ok(result),
+            }
         }
+        Err(ServiceError::InputRequiredRoundsExceeded {
+            max_rounds: DEFAULT_MRTR_MAX_ROUNDS,
+        })
     }
 
     async fn list_prompts(
@@ -1679,5 +1875,90 @@ mod tests {
             received,
             ServerNotification::ProgressNotification(_)
         ));
+    }
+
+    fn form_elicitation_params() -> ElicitRequestParams {
+        ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message: "Approve this write?".to_string(),
+            requested_schema: serde_json::from_value(json!({
+                "type": "object",
+                "properties": { "approve": { "type": "string" } },
+                "required": ["approve"]
+            }))
+            .expect("valid elicitation schema"),
+        }
+    }
+
+    async fn drive_elicitation(outcome: ElicitationOutcome) -> ElicitResult {
+        let manager = Arc::new(ActionRequiredManager::new());
+        let mut action_required_rx = manager
+            .register_action_required_stream("session-a".to_string(), "tool-call-a".to_string())
+            .await;
+
+        let fulfil = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                fulfill_elicitation(
+                    &manager,
+                    "session-a".to_string(),
+                    "tool-call-a".to_string(),
+                    &form_elicitation_params(),
+                )
+                .await
+            })
+        };
+
+        let message = tokio::time::timeout(Duration::from_secs(1), action_required_rx.recv())
+            .await
+            .expect("timed out waiting for elicitation message")
+            .expect("action-required stream closed");
+        let request_id = match &message.content[0] {
+            crate::conversation::message::MessageContent::ActionRequired(action_required) => {
+                match &action_required.data {
+                    crate::conversation::message::ActionRequiredData::Elicitation {
+                        id, ..
+                    } => id.clone(),
+                    _ => panic!("expected elicitation action-required message"),
+                }
+            }
+            _ => panic!("expected action-required message"),
+        };
+
+        manager
+            .claim_response("session-a", &request_id)
+            .await
+            .expect("claim pending elicitation")
+            .submit(outcome)
+            .expect("submit elicitation outcome");
+
+        fulfil
+            .await
+            .expect("fulfilment task panicked")
+            .expect("fulfilment should succeed")
+    }
+
+    #[tokio::test]
+    async fn test_fulfill_elicitation_maps_accept_with_content() {
+        let result =
+            drive_elicitation(ElicitationOutcome::Accept(json!({ "approve": "yes" }))).await;
+        assert_eq!(result.action, ElicitationAction::Accept);
+        assert_eq!(result.content, Some(json!({ "approve": "yes" })));
+
+        // The wire shape is what MRTR input responses echo back to the server.
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["action"], "accept");
+        assert_eq!(wire["content"]["approve"], "yes");
+    }
+
+    #[tokio::test]
+    async fn test_fulfill_elicitation_maps_decline_and_cancel() {
+        let declined = drive_elicitation(ElicitationOutcome::Decline).await;
+        assert_eq!(declined.action, ElicitationAction::Decline);
+        assert_eq!(declined.content, None);
+
+        let cancelled = drive_elicitation(ElicitationOutcome::Cancel).await;
+        assert_eq!(cancelled.action, ElicitationAction::Cancel);
+        assert_eq!(cancelled.content, None);
     }
 }
